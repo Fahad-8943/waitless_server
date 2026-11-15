@@ -27,6 +27,10 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
+      // Global identity roles.
+      // NOTE: 'staff' is deprecated as a global role in Phase 3; retained temporarily for
+      // backwards compatibility with legacy records before migration. In Phase 3+, staff
+      // memberships and capabilities are strictly managed via the scoped Staff collection.
       enum: ["customer", "provider", "staff", "admin"],
       default: "customer",
       required: true,

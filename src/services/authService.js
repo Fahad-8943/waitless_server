@@ -8,6 +8,7 @@ const RefreshToken = require("../models/RefreshToken");
 const env = require("../config/env");
 const ApiError = require("../utils/apiError");
 const logger = require("../utils/logger");
+const { withTransactionRetry } = require("../utils/transaction");
 
 const BCRYPT_ROUNDS = 12;
 const CONCURRENCY_WINDOW_MS = 5000; // 5-second window to distinguish simultaneous network race conditions from token theft
@@ -58,46 +59,6 @@ const hashToken = (token) => {
   return crypto.createHash("sha256").update(token).digest("hex");
 };
 
-/**
- * Execute an operation within a MongoDB transaction if a replica set is active.
- * Handles TransientTransactionError with exponential backoff retries.
- */
-const withTransactionRetry = async (workFn, maxRetries = 3) => {
-  const isReplicaSet = Boolean(
-    mongoose.connection.client &&
-    mongoose.connection.client.topology &&
-    mongoose.connection.client.topology.description.type !== "Single"
-  );
-
-  if (!isReplicaSet) {
-    // Standalone single-node development mode fallback
-    return await workFn(null);
-  }
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const session = await mongoose.startSession();
-    try {
-      session.startTransaction();
-      const result = await workFn(session);
-      if (session.inTransaction()) {
-        await session.commitTransaction();
-      }
-      return result;
-    } catch (err) {
-      if (session.inTransaction()) {
-        await session.abortTransaction();
-      }
-      const isTransient = err.hasErrorLabel && err.hasErrorLabel("TransientTransactionError");
-      if (isTransient && attempt < maxRetries) {
-        await new Promise((resolve) => setTimeout(resolve, attempt * 50));
-        continue;
-      }
-      throw err;
-    } finally {
-      session.endSession();
-    }
-  }
-};
 
 /**
  * Public customer registration service.

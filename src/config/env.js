@@ -56,6 +56,11 @@ const envSchema = z
         const num = parseInt(val, 10);
         return isNaN(num) ? val : num;
       }),
+
+    // Business Default Approval Status ("approved" in dev/test, "pending" in production)
+    DEFAULT_BUSINESS_APPROVAL_STATUS: z
+      .enum(["pending", "approved"])
+      .default(process.env.NODE_ENV === "production" ? "pending" : "approved"),
   })
   .refine(
     (data) => {
@@ -69,6 +74,19 @@ const envSchema = z
       message: "COOKIE_SECURE must be true when COOKIE_SAME_SITE is 'none'",
       path: ["COOKIE_SECURE"],
     }
+  )
+  .refine(
+    (data) => {
+      // Production must never allow automatic pre-approval of businesses
+      if (data.NODE_ENV === "production" && data.DEFAULT_BUSINESS_APPROVAL_STATUS === "approved") {
+        return false;
+      }
+      return true;
+    },
+    {
+      message: "DEFAULT_BUSINESS_APPROVAL_STATUS cannot be 'approved' in production environments",
+      path: ["DEFAULT_BUSINESS_APPROVAL_STATUS"],
+    }
   );
 
 const parsed = envSchema.safeParse(process.env);
@@ -80,4 +98,5 @@ if (!parsed.success) {
   throw new Error("Invalid environment configuration. Check your .env settings.");
 }
 
+parsed.data.envSchema = envSchema;
 module.exports = parsed.data;
