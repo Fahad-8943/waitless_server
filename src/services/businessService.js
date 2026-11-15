@@ -1,5 +1,4 @@
 const Business = require("../models/Business");
-const Staff = require("../models/Staff");
 const User = require("../models/User");
 const { withTransactionRetry } = require("../utils/transaction");
 const { signAccessToken } = require("./authService");
@@ -11,13 +10,12 @@ const ApiError = require("../utils/apiError");
  *
  * Transaction Workflow:
  * 1. Inside transaction:
- *    a. If user.role === 'customer', elevate role to 'provider' and increment tokenVersion + 1.
+ *    a. If user.role === 'customer', conditionally elevate role to 'provider' and increment tokenVersion + 1.
  *    b. Insert Business document (ownerId = user._id, approvalStatus = env.DEFAULT_BUSINESS_APPROVAL_STATUS).
- *    c. Create exactly one initial Staff membership record with role = 'owner'.
  * 2. Commit transaction.
  * 3. ONLY after successful commit, issue a fresh access token (if elevated) with role: 'provider'
  *    and the updated tokenVersion, invalidating the old customer access token.
- * 4. Return { business, staff, accessToken }.
+ * 4. Return { business, accessToken }.
  */
 const registerBusiness = async (user, payload) => {
   let roleElevated = false;
@@ -73,23 +71,10 @@ const registerBusiness = async (user, payload) => {
 
     const [business] = await Business.create([businessData], { session });
 
-    // 3. Create exactly one initial Staff record with role: 'owner' (strictly synchronized with business.ownerId)
-    const staffData = {
-      businessId: business._id,
-      userId: business.ownerId,
-      name: updatedUser.name || `${payload.name} Owner`,
-      role: "owner",
-      assignedServices: [],
-      isAvailable: true,
-      isActive: true,
-    };
-
-    const [staff] = await Staff.create([staffData], { session });
-
-    return { business, staff };
+    return { business };
   });
 
-  // 4. Issue fresh access token ONLY after successful transaction commit
+  // 3. Issue fresh access token ONLY after successful transaction commit
   let newAccessToken = null;
   if (roleElevated) {
     newAccessToken = signAccessToken(updatedUser);
@@ -97,7 +82,6 @@ const registerBusiness = async (user, payload) => {
 
   return {
     business: result.business,
-    staff: result.staff,
     accessToken: newAccessToken,
   };
 };

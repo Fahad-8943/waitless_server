@@ -3,8 +3,8 @@ const logger = require("./logger");
 
 /**
  * Migration helper: Safely migrate any legacy global users with role: 'staff' to role: 'customer'.
- * In Phase 3, staff capabilities and venue associations are strictly managed via the
- * business-scoped Staff collection.
+ * In the simplified WaitLess architecture, the active roles are strictly 'customer',
+ * 'provider' (business owner), and 'admin' (platform admin).
  *
  * @returns {Promise<{ matchedCount: number, modifiedCount: number }>}
  */

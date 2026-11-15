@@ -4,7 +4,7 @@ const ApiResponse = require("../utils/apiResponse");
 
 /**
  * Handle new business registration.
- * Transactionally elevates customer to provider and creates owner staff membership.
+ * Transactionally creates Business with ownerId and elevates customer to provider.
  */
 const registerBusiness = async (req, res) => {
   const validated = registerBusinessSchema.parse(req.body);
@@ -13,7 +13,6 @@ const registerBusiness = async (req, res) => {
 
   return ApiResponse.created(res, "Business venue registered successfully", {
     business: result.business,
-    staff: result.staff,
     accessToken: result.accessToken,
   });
 };
@@ -31,17 +30,17 @@ const getMyBusinesses = async (req, res) => {
 
 /**
  * Scoped access verification handler.
- * Used to verify tenant authorization and membership boundaries.
+ * Used to verify direct business ownership and administrator oversight.
  */
 const verifyAccess = async (req, res) => {
   return ApiResponse.ok(res, "Access granted to business venue", {
     business: {
       _id: req.business._id,
       name: req.business.name,
+      ownerId: req.business.ownerId,
       approvalStatus: req.business.approvalStatus,
       isActive: req.business.isActive,
     },
-    staff: req.staffMembership,
     isPlatformAdmin: req.isPlatformAdmin,
   });
 };

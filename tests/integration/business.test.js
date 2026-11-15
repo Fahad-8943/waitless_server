@@ -18,7 +18,6 @@ process.env.DEFAULT_BUSINESS_APPROVAL_STATUS = "approved";
 const app = require("../../src/app");
 const User = require("../../src/models/User");
 const Business = require("../../src/models/Business");
-const Staff = require("../../src/models/Staff");
 const RefreshToken = require("../../src/models/RefreshToken");
 const { signAccessToken } = require("../../src/services/authService");
 const { migrateLegacyStaffRoles } = require("../../src/utils/migrations");
@@ -59,9 +58,9 @@ const sampleBusinessPayload = {
   },
 };
 
-describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () => {
+describe("Simplified Business Ownership & Authorization Integration Tests", () => {
   before(async () => {
-    // Start In-Memory MongoDB Replica Set to support transactions
+    // Start In-Memory MongoDB Replica Set to support multi-document transactions
     replSet = await MongoMemoryReplSet.create({
       replSet: { count: 1, storageEngine: "wiredTiger" },
     });
@@ -79,7 +78,6 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
   beforeEach(async () => {
     await User.deleteMany({});
     await Business.deleteMany({});
-    await Staff.deleteMany({});
     await RefreshToken.deleteMany({});
   });
 
@@ -89,7 +87,7 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
       name,
       email,
       phone,
-      passwordHash: "$2a$12$e8vK1N1/wD7C4oA8f.W.eeM6h6PqvR7h7D8e8w9f0g1h2i3j4k5l6", // dummy hash
+      passwordHash: "$2a$12$e8vK1N1/wD7C4oA8f.W.eeM6h6PqvR7h7D8e8w9f0g1h2i3j4k5l6",
       role,
       tokenVersion,
       isActive: true,
@@ -98,10 +96,10 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     return { user, token };
   };
 
-  // 1. Atomic Registration & Role Elevation
-  it("1. Should transactionally register a business, elevate customer to provider, increment tokenVersion, and create initial owner staff", async () => {
+  // 1. Atomic Registration & Direct Ownership
+  it("1. Should transactionally register a business, bind ownerId to user, elevate customer to provider, and increment tokenVersion", async () => {
     const { user, token: initialToken } = await createTestUser({
-      name: "Alice Barber",
+      name: "Alice Owner",
       email: "alice@example.com",
       role: "customer",
       tokenVersion: 0,
@@ -116,9 +114,8 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     assert.strictEqual(res.body.success, true);
     assert.ok(res.body.data.business._id);
     assert.strictEqual(res.body.data.business.name, "Crown & Blade Studio");
+    assert.strictEqual(res.body.data.business.ownerId.toString(), user._id.toString());
     assert.strictEqual(res.body.data.business.approvalStatus, "approved");
-    assert.ok(res.body.data.staff._id);
-    assert.strictEqual(res.body.data.staff.role, "owner");
     assert.ok(res.body.data.accessToken, "Should return fresh access token after role elevation");
 
     // Database verification: User model
@@ -126,16 +123,14 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     assert.strictEqual(dbUser.role, "provider", "User role must be elevated to provider");
     assert.strictEqual(dbUser.tokenVersion, 1, "tokenVersion must be incremented by 1");
 
-    // Database verification: Exactly one Staff owner record
-    const staffRecords = await Staff.find({ businessId: res.body.data.business._id });
-    assert.strictEqual(staffRecords.length, 1, "Exactly one Staff record must exist");
-    assert.strictEqual(staffRecords[0].role, "owner");
-    assert.strictEqual(staffRecords[0].userId.toString(), user._id.toString());
+    // Database verification: Business model
+    const dbBusiness = await Business.findById(res.body.data.business._id);
+    assert.strictEqual(dbBusiness.ownerId.toString(), user._id.toString());
   });
 
   // 2. Old Token Invalidation & New Token Validity
   it("2. Should invalidate old customer token immediately and accept newly issued provider token", async () => {
-    const { user, token: oldToken } = await createTestUser({
+    const { token: oldToken } = await createTestUser({
       name: "Bob Stylist",
       email: "bob@example.com",
       role: "customer",
@@ -178,7 +173,7 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
   });
 
   // 3. Transaction Rollback Integrity
-  it("3. Should roll back business creation, staff creation, and user role elevation if any step in transaction fails", async () => {
+  it("3. Should roll back business creation and user role elevation if any step in transaction fails", async () => {
     const { user, token } = await createTestUser({
       name: "Charlie Brown",
       email: "charlie@example.com",
@@ -186,10 +181,10 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
       tokenVersion: 0,
     });
 
-    // Temporarily mock Staff.create to simulate an unexpected database failure inside the transaction
-    const originalStaffCreate = Staff.create;
-    Staff.create = async () => {
-      throw new Error("Simulated database failure during initial staff provisioning");
+    // Temporarily mock Business.create to simulate unexpected database failure inside transaction
+    const originalBusinessCreate = Business.create;
+    Business.create = async () => {
+      throw new Error("Simulated database write failure during business creation");
     };
 
     try {
@@ -200,18 +195,12 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
 
       assert.strictEqual(res.statusCode, 500);
     } finally {
-      // Restore original Staff.create
-      Staff.create = originalStaffCreate;
+      Business.create = originalBusinessCreate;
     }
 
     // Verify complete rollback in database:
-    // No Business created
     const bizCount = await Business.countDocuments({ ownerId: user._id });
     assert.strictEqual(bizCount, 0, "Business must not be persisted on transaction failure");
-
-    // No Staff created
-    const staffCount = await Staff.countDocuments({ userId: user._id });
-    assert.strictEqual(staffCount, 0, "Staff record must not be persisted on transaction failure");
 
     // User role & tokenVersion remained untouched
     const dbUser = await User.findById(user._id);
@@ -226,7 +215,7 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
   });
 
   // 4. Multiple Business Venues for Existing Provider
-  it("4. Should allow existing provider to register a second venue without bumping tokenVersion or changing global role", async () => {
+  it("4. Should allow existing provider to register additional venues without bumping tokenVersion or invalidating sessions", async () => {
     const { user, token: providerToken } = await createTestUser({
       name: "Dan Provider",
       email: "dan@example.com",
@@ -249,7 +238,7 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
       .send({ ...sampleBusinessPayload, name: "Venue Beta" });
     assert.strictEqual(res2.statusCode, 201);
 
-    // Verify tokenVersion remained 5
+    // Verify tokenVersion remained 5 (no session disruption)
     const dbUser = await User.findById(user._id);
     assert.strictEqual(dbUser.tokenVersion, 5);
     assert.strictEqual(dbUser.role, "provider");
@@ -261,16 +250,10 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
 
     assert.strictEqual(listRes.statusCode, 200);
     assert.strictEqual(listRes.body.data.businesses.length, 2);
-
-    // Each business has its own owner staff record
-    const staff1 = await Staff.findOne({ businessId: res1.body.data.business._id });
-    const staff2 = await Staff.findOne({ businessId: res2.body.data.business._id });
-    assert.strictEqual(staff1.role, "owner");
-    assert.strictEqual(staff2.role, "owner");
   });
 
-  // 5. Multi-Tenant Isolation & IDOR Defense (Manipulated Business ID)
-  it("5. Should block cross-business IDOR: Provider A cannot access Provider B's business endpoints", async () => {
+  // 5. Direct Ownership Authorization & Cross-Business IDOR Defense
+  it("5. Should block cross-business IDOR: Provider A cannot access Provider B's business venue", async () => {
     const { token: tokenA } = await createTestUser({
       name: "Owner A",
       email: "ownerA@example.com",
@@ -322,89 +305,11 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
 
     assert.strictEqual(legitRes.statusCode, 200);
     assert.strictEqual(legitRes.body.data.business.name, "Business A");
+    assert.strictEqual(legitRes.body.data.isPlatformAdmin, false);
   });
 
-  // 6. Fine-Grained Permission Matrix (Owner vs Manager vs Staff)
-  it("6. Should enforce permission matrix: Manager can access services but not staff; Staff member cannot access services", async () => {
-    const { token: ownerToken } = await createTestUser({
-      name: "Owner User",
-      email: "owner@matrix.com",
-      role: "provider",
-      tokenVersion: 1,
-    });
-
-    const { user: managerUser, token: managerToken } = await createTestUser({
-      name: "Manager User",
-      email: "manager@matrix.com",
-      role: "customer", // Global role remains customer!
-      tokenVersion: 1,
-    });
-
-    const { user: staffUser, token: staffToken } = await createTestUser({
-      name: "Staff User",
-      email: "staff@matrix.com",
-      role: "customer", // Global role remains customer!
-      tokenVersion: 1,
-    });
-
-    // Register Business
-    const regRes = await request(app)
-      .post("/api/v1/businesses/register")
-      .set("Authorization", `Bearer ${ownerToken}`)
-      .send(sampleBusinessPayload);
-    const businessId = regRes.body.data.business._id;
-
-    // Add Manager and Staff memberships in database
-    await Staff.create({
-      businessId,
-      userId: managerUser._id,
-      name: managerUser.name,
-      role: "manager",
-      isActive: true,
-    });
-
-    await Staff.create({
-      businessId,
-      userId: staffUser._id,
-      name: staffUser.name,
-      role: "staff",
-      isActive: true,
-    });
-
-    // Test 1: Staff attempts to access MANAGE_SERVICES endpoint -> Forbidden
-    const staffSvcRes = await request(app)
-      .get(`/api/v1/businesses/${businessId}/services-permission`)
-      .set("Authorization", `Bearer ${staffToken}`);
-    assert.strictEqual(staffSvcRes.statusCode, 403);
-    assert.strictEqual(staffSvcRes.body.error.code, "FORBIDDEN_ACTION");
-
-    // Test 2: Manager attempts to access MANAGE_SERVICES endpoint -> Allowed
-    const mgrSvcRes = await request(app)
-      .get(`/api/v1/businesses/${businessId}/services-permission`)
-      .set("Authorization", `Bearer ${managerToken}`);
-    assert.strictEqual(mgrSvcRes.statusCode, 200);
-
-    // Test 3: Manager attempts to access MANAGE_STAFF endpoint -> Forbidden (Only Owner/Admin)
-    const mgrStaffRes = await request(app)
-      .get(`/api/v1/businesses/${businessId}/staff-permission`)
-      .set("Authorization", `Bearer ${managerToken}`);
-    assert.strictEqual(mgrStaffRes.statusCode, 403);
-    assert.strictEqual(mgrStaffRes.body.error.code, "FORBIDDEN_ACTION");
-
-    // Test 4: Owner accesses both endpoints -> Both Allowed
-    const ownerSvcRes = await request(app)
-      .get(`/api/v1/businesses/${businessId}/services-permission`)
-      .set("Authorization", `Bearer ${ownerToken}`);
-    assert.strictEqual(ownerSvcRes.statusCode, 200);
-
-    const ownerStaffRes = await request(app)
-      .get(`/api/v1/businesses/${businessId}/staff-permission`)
-      .set("Authorization", `Bearer ${ownerToken}`);
-    assert.strictEqual(ownerStaffRes.statusCode, 200);
-  });
-
-  // 7. Explicit Platform Admin Access
-  it("7. Should allow platform admin explicit access to any business without Staff membership", async () => {
+  // 6. Explicit Platform Admin Access
+  it("6. Should allow platform admin explicit access to any business venue", async () => {
     const { token: providerToken } = await createTestUser({
       name: "Provider Venue",
       email: "venue@example.com",
@@ -427,7 +332,7 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
 
     // Admin accesses scoped business endpoint directly
     const adminRes = await request(app)
-      .get(`/api/v1/businesses/${businessId}/manage-permission`)
+      .get(`/api/v1/businesses/${businessId}/verify-access`)
       .set("Authorization", `Bearer ${adminToken}`);
 
     assert.strictEqual(adminRes.statusCode, 200);
@@ -436,15 +341,15 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     // Admin accessing a non-existent business returns 404
     const fakeId = new mongoose.Types.ObjectId();
     const notFoundRes = await request(app)
-      .get(`/api/v1/businesses/${fakeId}/manage-permission`)
+      .get(`/api/v1/businesses/${fakeId}/verify-access`)
       .set("Authorization", `Bearer ${adminToken}`);
 
     assert.strictEqual(notFoundRes.statusCode, 404);
     assert.strictEqual(notFoundRes.body.error.code, "BUSINESS_NOT_FOUND");
   });
 
-  // 8. Suspended & Deactivated Business Protection
-  it("8. Should block staff from deactivated or suspended businesses while retaining admin access", async () => {
+  // 7. Suspended & Deactivated Business Protection
+  it("7. Should block owner from deactivated or suspended businesses while retaining admin access", async () => {
     const { token: ownerToken } = await createTestUser({
       name: "Owner Suspended",
       email: "ownersus@example.com",
@@ -491,8 +396,8 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     assert.strictEqual(adminRes.body.data.isPlatformAdmin, true);
   });
 
-  // 9. Concurrent Business Registration
-  it("9. Should safely handle concurrent business registration requests without corrupting state", async () => {
+  // 8. Concurrent Business Registration
+  it("8. Should safely handle concurrent business registration requests without corrupting state", async () => {
     const { token: custToken } = await createTestUser({
       name: "Concurrent Frank",
       email: "frank@example.com",
@@ -515,24 +420,18 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     assert.strictEqual(res1.statusCode, 201);
     assert.strictEqual(res2.statusCode, 201);
 
-    // Verify 2 distinct businesses created
+    // Verify 2 distinct businesses created with proper ownerId
     const businesses = await Business.find({ name: /Concurrent Branch/ });
     assert.strictEqual(businesses.length, 2);
-
-    // Exactly one owner staff per business created
-    for (const biz of businesses) {
-      const owners = await Staff.find({ businessId: biz._id, role: "owner" });
-      assert.strictEqual(owners.length, 1);
-    }
   });
 
-  // 10. Audit & Safe Migration of Legacy Global Staff Users
-  it("10. Should safely migrate legacy users with global role: 'staff' to role: 'customer'", async () => {
+  // 9. Audit & Safe Migration of Legacy Global Staff Users
+  it("9. Should safely migrate legacy users with global role: 'staff' to role: 'customer'", async () => {
     const legacyUser = await User.create({
       name: "Legacy Staff Guy",
       email: "legacy@example.com",
       passwordHash: "$2a$12$e8vK1N1/wD7C4oA8f.W.eeM6h6PqvR7h7D8e8w9f0g1h2i3j4k5l6",
-      role: "staff", // Legacy role
+      role: "staff",
       tokenVersion: 0,
     });
 
@@ -547,101 +446,8 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     assert.strictEqual(migratedUser.role, "customer");
   });
 
-  // 11. Inactive Staff Membership Rejection
-  it("11. Should reject access when user has a staff record that is inactive (isActive: false)", async () => {
-    const { token: ownerToken } = await createTestUser({
-      name: "Owner For Deact",
-      email: "ownerdeact@example.com",
-      role: "provider",
-      tokenVersion: 1,
-    });
-
-    const { user: staffUser, token: staffToken } = await createTestUser({
-      name: "Deactivated Staff Member",
-      email: "deactstaff@example.com",
-      role: "customer",
-      tokenVersion: 1,
-    });
-
-    const regRes = await request(app)
-      .post("/api/v1/businesses/register")
-      .set("Authorization", `Bearer ${ownerToken}`)
-      .send(sampleBusinessPayload);
-    const businessId = regRes.body.data.business._id;
-
-    // Create inactive staff record
-    await Staff.create({
-      businessId,
-      userId: staffUser._id,
-      name: staffUser.name,
-      role: "staff",
-      isActive: false, // Inactive membership
-    });
-
-    // Attempt access
-    const res = await request(app)
-      .get(`/api/v1/businesses/${businessId}/verify-access`)
-      .set("Authorization", `Bearer ${staffToken}`);
-
-    assert.strictEqual(res.statusCode, 403);
-    assert.strictEqual(res.body.error.code, "FORBIDDEN_BUSINESS_ACCESS");
-  });
-
-  // 12. Multiple Active Owner Prevention via Partial Unique Index
-  it("12. Should enforce single active owner constraint at the database engine level", async () => {
-    const { user: user1, token: token1 } = await createTestUser({
-      name: "First Owner",
-      email: "firstowner@example.com",
-      role: "customer",
-      tokenVersion: 0,
-    });
-
-    const { user: user2 } = await createTestUser({
-      name: "Second Owner Attempt",
-      email: "secondowner@example.com",
-      role: "customer",
-      tokenVersion: 0,
-    });
-
-    const regRes = await request(app)
-      .post("/api/v1/businesses/register")
-      .set("Authorization", `Bearer ${token1}`)
-      .send(sampleBusinessPayload);
-    const businessId = regRes.body.data.business._id;
-
-    // Attempting to directly insert a second active owner for the same business venue must throw E11000 duplicate key error
-    await assert.rejects(
-      async () => {
-        await Staff.create({
-          businessId,
-          userId: user2._id,
-          name: user2.name,
-          role: "owner",
-          isActive: true,
-        });
-      },
-      (err) => {
-        assert.strictEqual(err.code, 11000, "Must violate partial unique index on role: 'owner'");
-        return true;
-      }
-    );
-
-    // If the first owner is deactivated, a new active owner can then be created
-    await Staff.updateOne({ businessId, userId: user1._id }, { $set: { isActive: false } });
-
-    const newOwner = await Staff.create({
-      businessId,
-      userId: user2._id,
-      name: user2.name,
-      role: "owner",
-      isActive: true,
-    });
-    assert.ok(newOwner._id);
-    assert.strictEqual(newOwner.role, "owner");
-  });
-
-  // 13. Migration Database Failure Handling
-  it("13. Should handle database failure during legacy role migration by logging and propagating error", async () => {
+  // 10. Migration Database Failure Handling
+  it("10. Should handle database failure during legacy role migration by logging and propagating error", async () => {
     const originalUpdateMany = User.updateMany;
     User.updateMany = async () => {
       throw new Error("Simulated database failure during migration");
@@ -661,8 +467,8 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     }
   });
 
-  // 14. Missing Authentication Rejection
-  it("14. Should reject unauthenticated requests to business endpoints with 401 TOKEN_MISSING", async () => {
+  // 11. Missing Authentication Rejection
+  it("11. Should reject unauthenticated requests to business endpoints with 401 TOKEN_MISSING", async () => {
     // 1. POST /register
     const regRes = await request(app)
       .post("/api/v1/businesses/register")
@@ -684,8 +490,8 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     assert.strictEqual(scopedRes.body.error.code, "TOKEN_MISSING");
   });
 
-  // 15. Invalid Business ID Syntax Rejection
-  it("15. Should reject invalid businessId syntax with 400 INVALID_BUSINESS_ID", async () => {
+  // 12. Invalid Business ID Syntax Rejection
+  it("12. Should reject invalid businessId syntax with 400 INVALID_BUSINESS_ID", async () => {
     const { token } = await createTestUser({
       name: "Valid User",
       email: "validuser@example.com",
@@ -701,8 +507,8 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     assert.strictEqual(res.body.error.code, "INVALID_BUSINESS_ID");
   });
 
-  // 16. Customer Rejection from Provider-Only Business Listing
-  it("16. Should reject customer role from GET /businesses/my/list with 403 FORBIDDEN", async () => {
+  // 13. Customer Rejection from Provider-Only Business Listing
+  it("13. Should reject customer role from GET /businesses/my/list with 403 FORBIDDEN", async () => {
     const { token: customerToken } = await createTestUser({
       name: "Regular Customer",
       email: "customeronly@example.com",
@@ -718,8 +524,8 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     assert.strictEqual(res.body.error.code, "FORBIDDEN");
   });
 
-  // 17. Production Configuration Refinement Rejection
-  it("17. Should enforce that DEFAULT_BUSINESS_APPROVAL_STATUS cannot be 'approved' in production", () => {
+  // 14. Production Configuration Refinement Rejection
+  it("14. Should enforce that DEFAULT_BUSINESS_APPROVAL_STATUS cannot be 'approved' in production", () => {
     const baseConfig = {
       PORT: "5000",
       MONGO_URI: "mongodb://localhost:27017/waitless_test",
@@ -760,76 +566,5 @@ describe("Phase 3A — Business, Staff & Multi-Tenant Authorization Tests", () =
     });
     assert.strictEqual(validProd.success, true);
     assert.strictEqual(validProd.data.DEFAULT_BUSINESS_APPROVAL_STATUS, "pending");
-  });
-
-  // 18. Business.ownerId and Owner Staff Membership Synchronization & Rollback Cleanliness
-  it("18. Should ensure Business.ownerId strictly matches userId of exactly one active owner Staff membership, and verify rollback leaves zero owner records", async () => {
-    // --- Part A: Successful Registration Consistency ---
-    const { user: userA, token: tokenA } = await createTestUser({
-      name: "Owner Sync User",
-      email: "ownersync@example.com",
-      role: "customer",
-      tokenVersion: 0,
-    });
-
-    const regRes = await request(app)
-      .post("/api/v1/businesses/register")
-      .set("Authorization", `Bearer ${tokenA}`)
-      .send(sampleBusinessPayload);
-
-    assert.strictEqual(regRes.statusCode, 201);
-    const businessId = regRes.body.data.business._id;
-
-    const dbBusiness = await Business.findById(businessId);
-    assert.ok(dbBusiness);
-    assert.strictEqual(dbBusiness.ownerId.toString(), userA._id.toString());
-
-    // Verify exactly one active Staff membership with role: 'owner' exists
-    const activeOwners = await Staff.find({
-      businessId: dbBusiness._id,
-      role: "owner",
-      isActive: true,
-    });
-    assert.strictEqual(activeOwners.length, 1, "Must have exactly one active owner Staff record");
-    assert.strictEqual(
-      activeOwners[0].userId.toString(),
-      dbBusiness.ownerId.toString(),
-      "Staff.userId must strictly match Business.ownerId"
-    );
-
-    // Verify no extraneous staff memberships were provisioned
-    const totalStaff = await Staff.find({ businessId: dbBusiness._id });
-    assert.strictEqual(totalStaff.length, 1, "Must not create extra staff records");
-
-    // --- Part B: Rollback Consistency (Leaves zero owner records) ---
-    const { user: userB, token: tokenB } = await createTestUser({
-      name: "Failing Registration User",
-      email: "failingreg@example.com",
-      role: "customer",
-      tokenVersion: 0,
-    });
-
-    const originalStaffCreate = Staff.create;
-    Staff.create = async () => {
-      throw new Error("Simulated database failure during owner staff insertion");
-    };
-
-    try {
-      const failRes = await request(app)
-        .post("/api/v1/businesses/register")
-        .set("Authorization", `Bearer ${tokenB}`)
-        .send(sampleBusinessPayload);
-
-      assert.strictEqual(failRes.statusCode, 500);
-    } finally {
-      Staff.create = originalStaffCreate;
-    }
-
-    // Verify that rollback leaves zero business records and zero owner staff records
-    const rolledBackBusinesses = await Business.find({ ownerId: userB._id });
-    assert.strictEqual(rolledBackBusinesses.length, 0, "No business record must exist after rollback");
-
-    const rolledBackStaff = await Staff.find({ userId: userB._id });
-    assert.strictEqual(rolledBackStaff.length, 0, "No owner staff membership must exist after rollback");
   });
 });
