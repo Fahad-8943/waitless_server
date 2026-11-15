@@ -96,7 +96,118 @@ const getMyBusinesses = async (userId) => {
   return await Business.find({ ownerId: userId, isActive: true }).sort({ createdAt: -1 });
 };
 
+/**
+ * Retrieve one business profile by ID.
+ *
+ * @param {string|ObjectId} businessId
+ * @returns {Promise<Business>}
+ */
+const getBusinessById = async (businessId) => {
+  const business = await Business.findById(businessId);
+  if (!business) {
+    throw ApiError.notFound("Business venue not found", "BUSINESS_NOT_FOUND");
+  }
+  return business;
+};
+
+/**
+ * Partially update a business profile.
+ * Preserves omitted fields and prevents changes to internal/protected fields.
+ *
+ * @param {string|ObjectId} businessId
+ * @param {Object} payload - Validated update fields
+ * @returns {Promise<Business>}
+ */
+const updateBusinessProfile = async (businessId, payload) => {
+  const updateOps = {};
+
+  if (payload.name !== undefined) updateOps.name = payload.name;
+  if (payload.category !== undefined) updateOps.category = payload.category;
+  if (payload.description !== undefined) updateOps.description = payload.description;
+  if (payload.timezone !== undefined) updateOps.timezone = payload.timezone;
+
+  if (payload.contact) {
+    if (payload.contact.email !== undefined) updateOps["contact.email"] = payload.contact.email;
+    if (payload.contact.phone !== undefined) updateOps["contact.phone"] = payload.contact.phone;
+  }
+
+  if (payload.address) {
+    if (payload.address.street !== undefined) updateOps["address.street"] = payload.address.street;
+    if (payload.address.city !== undefined) updateOps["address.city"] = payload.address.city;
+    if (payload.address.state !== undefined) updateOps["address.state"] = payload.address.state;
+    if (payload.address.postalCode !== undefined) updateOps["address.postalCode"] = payload.address.postalCode;
+    if (payload.address.country !== undefined) updateOps["address.country"] = payload.address.country;
+  }
+
+  if (payload.location && payload.location.coordinates !== undefined) {
+    updateOps["location.coordinates"] = payload.location.coordinates;
+    updateOps["location.type"] = "Point";
+  }
+
+  if (Object.keys(updateOps).length === 0) {
+    return await getBusinessById(businessId);
+  }
+
+  const updated = await Business.findByIdAndUpdate(
+    businessId,
+    { $set: updateOps },
+    { returnDocument: "after", runValidators: true }
+  );
+
+  if (!updated) {
+    throw ApiError.notFound("Business venue not found", "BUSINESS_NOT_FOUND");
+  }
+
+  return updated;
+};
+
+/**
+ * Get sanitized public business profile.
+ * Only returns venues that are both approved and active.
+ * Never exposes internal fields (ownerId, approvalStatus, policies, etc.).
+ *
+ * @param {string|ObjectId} businessId
+ * @returns {Promise<Object>}
+ */
+const getPublicBusinessProfile = async (businessId) => {
+  const business = await Business.findOne({
+    _id: businessId,
+    approvalStatus: "approved",
+    isActive: true,
+  });
+
+  if (!business) {
+    throw ApiError.notFound("Business venue not found", "BUSINESS_NOT_FOUND");
+  }
+
+  return {
+    _id: business._id,
+    name: business.name,
+    category: business.category,
+    description: business.description,
+    contact: {
+      email: business.contact?.email || null,
+      phone: business.contact?.phone || null,
+    },
+    address: {
+      street: business.address.street,
+      city: business.address.city,
+      state: business.address.state,
+      postalCode: business.address.postalCode,
+      country: business.address.country,
+    },
+    location: {
+      type: business.location.type,
+      coordinates: business.location.coordinates,
+    },
+    timezone: business.timezone,
+  };
+};
+
 module.exports = {
   registerBusiness,
   getMyBusinesses,
+  getBusinessById,
+  updateBusinessProfile,
+  getPublicBusinessProfile,
 };

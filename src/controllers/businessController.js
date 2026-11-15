@@ -1,6 +1,11 @@
+const mongoose = require("mongoose");
 const businessService = require("../services/businessService");
-const { registerBusinessSchema } = require("../validators/businessValidators");
+const {
+  registerBusinessSchema,
+  updateBusinessProfileSchema,
+} = require("../validators/businessValidators");
 const ApiResponse = require("../utils/apiResponse");
+const ApiError = require("../utils/apiError");
 
 /**
  * Handle new business registration.
@@ -29,6 +34,58 @@ const getMyBusinesses = async (req, res) => {
 };
 
 /**
+ * Retrieve one business profile for the owner or platform admin.
+ */
+const getBusinessProfile = async (req, res) => {
+  return ApiResponse.ok(res, "Business profile retrieved successfully", {
+    business: req.business,
+    isPlatformAdmin: req.isPlatformAdmin,
+  });
+};
+
+/**
+ * Update business profile details.
+ * Restricted strictly to the direct business owner; platform admins are view-only.
+ */
+const updateBusinessProfile = async (req, res) => {
+  // Platform admins are strictly view-only for business profile updates
+  if (req.isPlatformAdmin || req.user.role === "admin") {
+    throw ApiError.forbidden(
+      "Platform administrators are view-only and cannot update business profiles",
+      "ADMIN_UPDATE_FORBIDDEN"
+    );
+  }
+
+  const validated = updateBusinessProfileSchema.parse(req.body);
+  const updatedBusiness = await businessService.updateBusinessProfile(
+    req.business._id,
+    validated
+  );
+
+  return ApiResponse.ok(res, "Business profile updated successfully", {
+    business: updatedBusiness,
+  });
+};
+
+/**
+ * Retrieve sanitized public business profile.
+ * Only returns venues that are approved and active.
+ */
+const getPublicBusinessProfile = async (req, res) => {
+  const { businessId } = req.params;
+
+  if (!businessId || !mongoose.Types.ObjectId.isValid(businessId)) {
+    throw ApiError.badRequest("Invalid business ID format", "INVALID_BUSINESS_ID");
+  }
+
+  const publicProfile = await businessService.getPublicBusinessProfile(businessId);
+
+  return ApiResponse.ok(res, "Public business profile retrieved successfully", {
+    business: publicProfile,
+  });
+};
+
+/**
  * Scoped access verification handler.
  * Used to verify direct business ownership and administrator oversight.
  */
@@ -48,5 +105,8 @@ const verifyAccess = async (req, res) => {
 module.exports = {
   registerBusiness,
   getMyBusinesses,
+  getBusinessProfile,
+  updateBusinessProfile,
+  getPublicBusinessProfile,
   verifyAccess,
 };
