@@ -27,8 +27,8 @@ class ApiResponse {
     return ApiResponse.send(res, 200, message, data, meta);
   }
 
-  static created(res, message = "Resource created successfully", data = null) {
-    return ApiResponse.send(res, 201, message, data);
+  static created(res, message = "Resource created successfully", data = null, meta = null) {
+    return ApiResponse.send(res, 201, message, data, meta);
   }
 
   static noContent(res) {

@@ -68,6 +68,18 @@ const updateBusinessProfile = async (req, res) => {
 };
 
 /**
+ * List approved and active businesses for public discovery.
+ */
+const getPublicBusinesses = async (req, res) => {
+  const result = await businessService.getPublicBusinesses(req.query);
+
+  return ApiResponse.ok(res, "Public businesses retrieved successfully", {
+    businesses: result.businesses,
+    pagination: result.pagination,
+  });
+};
+
+/**
  * Retrieve sanitized public business profile.
  * Only returns venues that are approved and active.
  */
@@ -107,6 +119,7 @@ module.exports = {
   getMyBusinesses,
   getBusinessProfile,
   updateBusinessProfile,
+  getPublicBusinesses,
   getPublicBusinessProfile,
   verifyAccess,
 };

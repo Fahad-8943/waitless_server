@@ -204,10 +204,85 @@ const getPublicBusinessProfile = async (businessId) => {
   };
 };
 
+/**
+ * List approved and active businesses for public discovery.
+ * Supports filtering by category, search term (name/city), and pagination.
+ * Never exposes private/internal business fields.
+ *
+ * @param {Object} queryParams
+ * @returns {Promise<{ businesses: Array, pagination: Object }>}
+ */
+const getPublicBusinesses = async (queryParams = {}) => {
+  const filter = {
+    approvalStatus: "approved",
+    isActive: true,
+  };
+
+  if (queryParams.category) {
+    filter.category = queryParams.category;
+  }
+
+  if (queryParams.search && queryParams.search.trim()) {
+    const term = queryParams.search.trim();
+    filter.$or = [
+      { name: { $regex: term, $options: "i" } },
+      { "address.city": { $regex: term, $options: "i" } },
+    ];
+  }
+
+  const page = Math.max(1, parseInt(queryParams.page, 10) || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(queryParams.limit, 10) || 20));
+  const skip = (page - 1) * limit;
+
+  const [businesses, total] = await Promise.all([
+    Business.find(filter)
+      .select("_id name category description contact address location timezone createdAt")
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit),
+    Business.countDocuments(filter),
+  ]);
+
+  const sanitized = businesses.map((b) => ({
+    _id: b._id,
+    name: b.name,
+    category: b.category,
+    description: b.description,
+    contact: {
+      email: b.contact?.email || null,
+      phone: b.contact?.phone || null,
+    },
+    address: {
+      street: b.address.street,
+      city: b.address.city,
+      state: b.address.state,
+      postalCode: b.address.postalCode,
+      country: b.address.country,
+    },
+    location: {
+      type: b.location.type,
+      coordinates: b.location.coordinates,
+    },
+    timezone: b.timezone,
+    createdAt: b.createdAt,
+  }));
+
+  return {
+    businesses: sanitized,
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit) || 1,
+    },
+  };
+};
+
 module.exports = {
   registerBusiness,
   getMyBusinesses,
   getBusinessById,
   updateBusinessProfile,
   getPublicBusinessProfile,
+  getPublicBusinesses,
 };
