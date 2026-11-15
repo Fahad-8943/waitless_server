@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
+const cookieParser = require("cookie-parser");
 
 const env = require("./config/env");
 const v1Router = require("./routes/v1");
@@ -10,6 +11,11 @@ const errorHandler = require("./middleware/error");
 const ApiResponse = require("./utils/apiResponse");
 
 const app = express();
+
+// Configure Reverse Proxy Trust
+if (env.TRUST_PROXY !== false) {
+  app.set("trust proxy", env.TRUST_PROXY);
+}
 
 // Security Headers
 app.use(helmet());
@@ -47,9 +53,10 @@ if (env.NODE_ENV !== "test") {
   );
 }
 
-// Request Body Parsers
+// Request Body & Cookie Parsers
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use(cookieParser());
 
 // Root Information Route
 app.get("/", (req, res) => {
