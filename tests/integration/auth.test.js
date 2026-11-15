@@ -295,8 +295,8 @@ describe("Phase 2 — Authentication & Authorization Integration Tests", () => {
     assert.strictEqual(oldToken.familyId, newToken.familyId);
   });
 
-  // 7. Concurrent Duplicate Refresh Race & Grace Period
-  it("7. Should handle simultaneous concurrent refresh requests cleanly without false theft", async () => {
+  // 7. Concurrent Refresh Race: Single-Use Token Enforcement
+  it("7. Should handle simultaneous concurrent refresh requests: exactly one succeeds, loser gets no credentials, exactly one replacement token exists", async () => {
     const regRes = await request(app)
       .post("/api/v1/auth/register")
       .send({
@@ -312,69 +312,112 @@ describe("Phase 2 — Authentication & Authorization Integration Tests", () => {
       request(app).post("/api/v1/auth/refresh").set("Cookie", cookie).set("x-waitless-client", "1"),
     ]);
 
-    // Both requests must succeed (one rotated, the other safely replayed within grace window)
-    assert.strictEqual(res1.status, 200);
-    assert.strictEqual(res2.status, 200);
-    assert.ok(res1.body.data.accessToken);
-    assert.ok(res2.body.data.accessToken);
+    // Exactly one must succeed (200 OK) and exactly one must fail (409 Conflict)
+    const winningRes = res1.status === 200 ? res1 : res2;
+    const losingRes = res1.status === 200 ? res2 : res1;
 
-    // Verify user was NOT compromised: active tokens exist
+    // Winner receives replacement refresh token and new access token
+    assert.strictEqual(winningRes.status, 200);
+    assert.ok(winningRes.body.data.accessToken);
+    assert.ok(winningRes.headers["set-cookie"], "Winner receives new refresh token cookie");
+
+    // The losing request receives NO new credentials
+    assert.strictEqual(losingRes.status, 409);
+    assert.strictEqual(losingRes.body.error.code, "CONCURRENT_REFRESH_RACE");
+    assert.strictEqual(losingRes.body.data, undefined);
+    assert.strictEqual(losingRes.headers["set-cookie"], undefined, "Loser must NOT receive any refresh token cookie");
+
+    // Database verification: Exactly one active replacement refresh token exists
     const activeTokens = await RefreshToken.find({ isRevoked: false });
     assert.strictEqual(activeTokens.length, 1);
   });
 
-  // 8. Genuine Token Reuse & User-Wide Global Revocation
-  it("8. Should detect genuine token reuse and atomically revoke all sessions across all families", async () => {
-    const regRes = await request(app)
+  // 8. Genuine Token Reuse & User-Wide Global Revocation (with Cross-User Isolation)
+  it("8. Should detect genuine token reuse, trigger user-wide session revocation, and leave other users unaffected", async () => {
+    // User 1: Victim
+    const regRes1 = await request(app)
       .post("/api/v1/auth/register")
       .send({
         name: "Theft User",
         email: "theft@example.com",
         password: "ValidPassword123!",
       });
-    const cookie1 = regRes.headers["set-cookie"][0].split(";")[0];
+    const user1Cookie1 = regRes1.headers["set-cookie"][0].split(";")[0];
 
-    // Login a second session (Family 2)
-    const loginRes = await request(app)
+    // User 1: Second active session on Device B (Family 2)
+    const loginRes1B = await request(app)
       .post("/api/v1/auth/login")
       .send({
         identifier: "theft@example.com",
         password: "ValidPassword123!",
       });
-    const family2Cookie = loginRes.headers["set-cookie"][0].split(";")[0];
+    const user1CookieB = loginRes1B.headers["set-cookie"][0].split(";")[0];
 
-    // Rotate Family 1 once -> produces Cookie 1B
+    // User 2: Completely independent user
+    const regRes2 = await request(app)
+      .post("/api/v1/auth/register")
+      .send({
+        name: "Other User",
+        email: "other@example.com",
+        password: "ValidPassword123!",
+      });
+    const user2AccessToken = regRes2.body.data.accessToken;
+    const user2Cookie = regRes2.headers["set-cookie"][0].split(";")[0];
+
+    // Rotate User 1's Device A token once -> produces replacement token
     const rotRes = await request(app)
       .post("/api/v1/auth/refresh")
-      .set("Cookie", cookie1)
+      .set("Cookie", user1Cookie1)
       .set("x-waitless-client", "1");
     assert.strictEqual(rotRes.status, 200);
 
-    // Artificially age the revoked token past the 15s grace window to simulate true replay attack
+    // Artificially age the revoked token past the 5s concurrency window to simulate true later replay attack
     await RefreshToken.updateOne(
       { isRevoked: true },
-      { $set: { revokedAt: new Date(Date.now() - 30000) } } // 30 seconds ago
+      { $set: { revokedAt: new Date(Date.now() - 10000) } } // 10 seconds ago (outside 5s window)
     );
 
-    // Attacker reuses original Cookie 1 past grace period!
+    // Attacker reuses original rotated token later!
     const reuseRes = await request(app)
       .post("/api/v1/auth/refresh")
-      .set("Cookie", cookie1)
+      .set("Cookie", user1Cookie1)
       .set("x-waitless-client", "1");
 
     assert.strictEqual(reuseRes.status, 401);
     assert.strictEqual(reuseRes.body.error.code, "REVOKED_TOKEN_REUSE");
 
-    // Database verification: ALL tokens across ALL families are now revoked!
-    const activeTokensRemaining = await RefreshToken.countDocuments({ isRevoked: false });
-    assert.strictEqual(activeTokensRemaining, 0);
+    // Database verification: User 1 has ZERO active refresh tokens across ALL families
+    const user1ActiveTokens = await RefreshToken.countDocuments({
+      userId: regRes1.body.data.user._id,
+      isRevoked: false,
+    });
+    assert.strictEqual(user1ActiveTokens, 0);
 
-    const revokedTokens = await RefreshToken.find({ revocationReason: "THEFT_DETECTED" });
-    assert.ok(revokedTokens.length >= 2);
+    // User 1's tokenVersion must be incremented
+    const user1 = await User.findById(regRes1.body.data.user._id);
+    assert.strictEqual(user1.tokenVersion, 1);
 
-    // User tokenVersion must be incremented
-    const user = await User.findOne({ email: "theft@example.com" });
-    assert.strictEqual(user.tokenVersion, 1);
+    // User 2 must be COMPLETELY UNAFFECTED
+    const user2 = await User.findById(regRes2.body.data.user._id);
+    assert.strictEqual(user2.tokenVersion, 0);
+
+    const user2ActiveTokens = await RefreshToken.countDocuments({
+      userId: regRes2.body.data.user._id,
+      isRevoked: false,
+    });
+    assert.strictEqual(user2ActiveTokens, 1);
+
+    // User 2's session continues to work seamlessly
+    const user2MeRes = await request(app)
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${user2AccessToken}`);
+    assert.strictEqual(user2MeRes.status, 200);
+
+    const user2RefreshRes = await request(app)
+      .post("/api/v1/auth/refresh")
+      .set("Cookie", user2Cookie)
+      .set("x-waitless-client", "1");
+    assert.strictEqual(user2RefreshRes.status, 200);
   });
 
   // 9. Global Session Revocation via /logout-all

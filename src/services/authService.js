@@ -10,7 +10,7 @@ const ApiError = require("../utils/apiError");
 const logger = require("../utils/logger");
 
 const BCRYPT_ROUNDS = 12;
-const REPLAY_GRACE_PERIOD_MS = 15000; // 15-second grace window for concurrent network replays
+const CONCURRENCY_WINDOW_MS = 5000; // 5-second window to distinguish simultaneous network race conditions from token theft
 
 /**
  * Hash raw password with bcrypt.
@@ -276,38 +276,32 @@ const rotateRefreshToken = async ({ rawRefreshToken, clientIp }) => {
       throw ApiError.unauthorized("Refresh token has expired", "EXPIRED_REFRESH_TOKEN");
     }
 
-    // 3. Token is already revoked. Check for legitimate concurrent replay vs genuine theft
+    // 3. Token is already revoked. Check for concurrent race condition vs confirmed token reuse
     if (existing.isRevoked) {
       const nowMs = Date.now();
       const revokedAtMs = existing.revokedAt ? new Date(existing.revokedAt).getTime() : 0;
-      const isWithinGrace = (nowMs - revokedAtMs) <= REPLAY_GRACE_PERIOD_MS;
+      const isWithinConcurrencyWindow = (nowMs - revokedAtMs) <= CONCURRENCY_WINDOW_MS;
 
-      // Legitimate concurrent duplicate / network race within grace period
-      if (isWithinGrace && existing.revocationReason === "ROTATED" && existing.replacedByTokenHash) {
-        const replacement = await RefreshToken.findOne({
-          tokenHash: existing.replacedByTokenHash,
-          isRevoked: false,
-        }).session(session || null);
-
-        if (replacement) {
-          const user = await User.findById(existing.userId).session(session || null);
-          if (user && user.isActive) {
-            logger.info("Concurrent refresh replay within grace period handled cleanly", {
-              userId: user._id,
-              familyId: existing.familyId,
-            });
-            const accessToken = signAccessToken(user);
-            return {
-              accessToken,
-              rawRefreshToken: null, // Client keeps current active cookie
-              isDuplicateReplay: true,
-            };
-          }
-        }
+      // Concurrent request that lost the rotation race: issue NO credentials and trigger NO theft alarm
+      if (isWithinConcurrencyWindow && existing.revocationReason === "ROTATED") {
+        logger.warn("Concurrent refresh race condition detected; losing request rejected safely with zero credentials issued", {
+          userId: existing.userId,
+          familyId: existing.familyId,
+          ip: clientIp,
+        });
+        throw ApiError.conflict(
+          "A concurrent refresh request has already rotated this session token. Please use your latest credentials.",
+          "CONCURRENT_REFRESH_RACE"
+        );
       }
 
-      // GENUINE THEFT / REUSE OUTSIDE GRACE PERIOD
-      logger.warn(`SECURITY ALERT: Refresh token reuse detected for user ${existing.userId}! Triggering global session revocation.`, {
+      // If token was revoked for a reason other than rotation (e.g. standard logout)
+      if (existing.revocationReason !== "ROTATED") {
+        throw ApiError.unauthorized("Session has already been revoked or logged out", "SESSION_REVOKED");
+      }
+
+      // CONFIRMED TOKEN REUSE (Theft presentation of a previously rotated token outside concurrency window)
+      logger.warn(`SECURITY ALERT: Confirmed refresh token reuse detected for user ${existing.userId}! Triggering user-wide global session revocation.`, {
         userId: existing.userId,
         familyId: existing.familyId,
         ip: clientIp,
